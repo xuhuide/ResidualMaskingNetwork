@@ -5,6 +5,7 @@ import os
 import cv2
 import numpy as np
 import torch
+from huggingface_hub import hf_hub_download
 from torchvision.transforms import transforms
 
 from models import densenet121, resmasking_dropout1
@@ -24,49 +25,64 @@ def show(img, name="disp", width=1000):
     cv2.destroyAllWindows()
 
 
-checkpoint_url = "https://github.com/phamquiluan/ResidualMaskingNetwork/releases/download/v0.0.1/Z_resmasking_dropout1_rot30_2019Nov30_13.32"
+hf_repo_id = "phamquiluan/ResidualMaskingNetwork"
+checkpoint_filename = "Z_resmasking_dropout1_rot30_2019Nov30_13.32"
+yunet_checkpoint_filename = "face_detection_yunet_2023mar.onnx"
+
+github_release_url = (
+    "https://github.com/phamquiluan/ResidualMaskingNetwork/releases/download/v0.0.1"
+)
+
+# pre-downloaded files in the working directory take precedence,
+# otherwise checkpoints are fetched from the Hugging Face Hub cache
 local_checkpoint_path = "pretrained_ckpt"
-
-prototxt_url = "https://github.com/phamquiluan/ResidualMaskingNetwork/releases/download/v0.0.1/deploy.prototxt.txt"
-local_prototxt_path = "deploy.prototxt.txt"
-
-ssd_checkpoint_url = "https://github.com/phamquiluan/ResidualMaskingNetwork/releases/download/v0.0.1/res10_300x300_ssd_iter_140000.caffemodel"
-local_ssd_checkpoint_path = "res10_300x300_ssd_iter_140000.caffemodel"
+local_yunet_checkpoint_path = yunet_checkpoint_filename
 
 
-def download_checkpoint(remote_url, local_path):
+def download_from_github_release(filename, local_path):
+    """Stream a release asset to local_path, used when the Hub is unavailable."""
     import requests
-    from tqdm import tqdm
 
-    response = requests.get(remote_url, stream=True)
-    total_size_in_bytes = int(response.headers.get("content-length", 0))
-    block_size = 1024  # 1 Kibibyte
+    url = f"{github_release_url}/{filename}"
+    print(f"Downloading {url} -> {local_path}")
 
-    progress_bar = tqdm(
-        desc=f"Downloading {local_path}..",
-        total=total_size_in_bytes,
-        unit="iB",
-        unit_scale=True,
-    )
+    response = requests.get(url, stream=True, timeout=60)
+    response.raise_for_status()
 
-    with open(local_path, "wb") as ref:
-        for data in response.iter_content(block_size):
-            progress_bar.update(len(data))
-            ref.write(data)
-
-    progress_bar.close()
-    if total_size_in_bytes != 0 and progress_bar.n != total_size_in_bytes:
-        print("ERROR, something went wrong")
+    # write to a temporary name so an interrupted download is never mistaken
+    # for a complete checkpoint on the next import
+    partial_path = f"{local_path}.part"
+    with open(partial_path, "wb") as ref:
+        for chunk in response.iter_content(chunk_size=1024 * 1024):
+            ref.write(chunk)
+    os.replace(partial_path, local_path)
+    return local_path
 
 
-for remote_path, local_path in [
-    (checkpoint_url, local_checkpoint_path),
-    (prototxt_url, local_prototxt_path),
-    (ssd_checkpoint_url, local_ssd_checkpoint_path),
-]:
-    if not os.path.exists(local_path):
-        print(f"{local_path} does not exists!")
-        download_checkpoint(remote_url=remote_path, local_path=local_path)
+def fetch_checkpoint(filename, local_path):
+    """Prefer the Hub, fall back to the GitHub release it used to ship from.
+
+    The Hub rate-limits unauthenticated downloads (HTTP 429), which is easy to
+    hit from CI matrices or shared IPs, and a rate limit should not make the
+    package unimportable.
+    """
+    if os.path.exists(local_path):
+        return local_path
+
+    try:
+        return hf_hub_download(hf_repo_id, filename)
+    except Exception as error:
+        print(
+            f"Hugging Face Hub download failed ({type(error).__name__}: {error}); "
+            "falling back to the GitHub release"
+        )
+        return download_from_github_release(filename, local_path)
+
+
+local_checkpoint_path = fetch_checkpoint(checkpoint_filename, local_checkpoint_path)
+local_yunet_checkpoint_path = fetch_checkpoint(
+    yunet_checkpoint_filename, local_yunet_checkpoint_path
+)
 
 
 def ensure_color(image):
@@ -85,12 +101,14 @@ def ensure_gray(image):
     return image
 
 
-def get_ssd_face_detector():
-    ssd_face_detector = cv2.dnn.readNetFromCaffe(
-        prototxt=local_prototxt_path,
-        caffeModel=local_ssd_checkpoint_path,
+def get_yunet_face_detector():
+    yunet_face_detector = cv2.FaceDetectorYN.create(
+        model=local_yunet_checkpoint_path,
+        config="",
+        input_size=(320, 320),
+        score_threshold=0.5,
     )
-    return ssd_face_detector
+    return yunet_face_detector
 
 
 transform = transforms.Compose(
@@ -146,7 +164,7 @@ def convert_to_square(xmin, ymin, xmax, ymax):
 class RMN:
     def __init__(self, face_detector=True):
         if face_detector is True:
-            self.face_detector = get_ssd_face_detector()
+            self.face_detector = get_yunet_face_detector()
         self.emo_model = get_emo_model()
 
     @torch.no_grad()
@@ -278,27 +296,21 @@ class RMN:
         return frame
 
     def detect_faces(self, frame):
+        frame = ensure_color(frame)
         h, w = frame.shape[:2]
-        blob = cv2.dnn.blobFromImage(
-            cv2.resize(frame, (300, 300)),
-            1.0,
-            (300, 300),
-            (104.0, 177.0, 123.0),
-            False,
-            False,
-        )
-        self.face_detector.setInput(blob)
-        faces = self.face_detector.forward()
+        self.face_detector.setInputSize((w, h))
+        _, faces = self.face_detector.detect(frame)
 
         face_results = []
-        for i in range(0, faces.shape[2]):
-            confidence = faces[0, 0, i, 2]
-            if confidence < 0.5:
-                continue
-            xmin, ymin, xmax, ymax = (
-                faces[0, 0, i, 3:7] * np.array([w, h, w, h])
-            ).astype("int")
-            xmin, ymin, xmax, ymax = convert_to_square(xmin, ymin, xmax, ymax)
+        if faces is None:
+            return face_results
+        for face in faces:
+            xmin, ymin, bw, bh = face[:4].astype("int")
+            xmin, ymin, xmax, ymax = convert_to_square(
+                xmin, ymin, xmin + bw, ymin + bh
+            )
+            xmin = max(xmin, 0)
+            ymin = max(ymin, 0)
             if xmax <= xmin or ymax <= ymin:
                 continue
 

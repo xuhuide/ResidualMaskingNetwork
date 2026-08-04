@@ -4,10 +4,19 @@ from setuptools import find_packages, setup
 
 version = None
 with open("README.md") as ref:
-    data = ref.readlines()[5]
+    lines = ref.readlines()
     version_prefix = "version-v"
-    version = data[data.find(version_prefix) + len(version_prefix) : data.find("-blue")]
-    assert version is not None, data
+    
+    # Search for the line containing the version badge
+    for line in lines:
+        if version_prefix in line and "-blue" in line:
+            version = line[line.find(version_prefix) + len(version_prefix) : line.find("-blue")]
+            break
+    
+    if version is None:
+        raise ValueError("Could not find version pattern 'version-v...blue' in README.md")
+    
+    assert version is not None, f"Version parsing failed for README.md"
 
 cwd = os.path.dirname(os.path.abspath(__file__))
 version_path = os.path.join(cwd, "rmn", "version.py")
@@ -39,13 +48,25 @@ setup(
         ]
     ),
     include_package_data=True,
+    python_requires=">=3.8",
+    classifiers=[
+        "Programming Language :: Python :: 3.8",
+        "Programming Language :: Python :: 3.9",
+        "Programming Language :: Python :: 3.10",
+        "Programming Language :: Python :: 3.11",
+        "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
+        "License :: OSI Approved :: MIT License",
+        "Topic :: Scientific/Engineering :: Image Recognition",
+    ],
     install_requires=[
         "numpy",
-        "opencv-python",
+        "opencv-python>=4.8.0",
         "torch",
         "torchvision",
         "requests",
         "pytorchcv",
-        "tqdm",
+        "huggingface_hub",
     ],
 )
